@@ -10,6 +10,7 @@ from mmaudio.eval_utils import (
 )
 import tempfile
 import requests
+from datetime import datetime
 import torchaudio
 import torch
 from pathlib import Path
@@ -17,8 +18,14 @@ import logging
 import os
 from openai import OpenAI
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+import uvicorn
 
 load_dotenv()
+
+app = FastAPI(title="RhythmAI API", version="1.0.0")
 
 prompt = """
 Provide a detailed description of the background music the video should feature. The musical description should cover the following five elements:
@@ -36,6 +43,15 @@ client = OpenAI(
     api_key=os.getenv("API_KEY"),
     base_url=os.getenv("BASE_URL"),
 )
+
+
+class GenerateRequest(BaseModel):
+    video_url: str
+
+
+class PingResponse(BaseModel):
+    status: str
+    message: str
 
 
 def get_bgm_description(video_url: str) -> str:
@@ -151,8 +167,7 @@ def run_inference(video_url: str):
         cfg_strength=cfg_strength,
     )
     audio = audios.float().cpu()[0]
-    safe_filename = prompt.replace(" ", "_").replace("/", "_").replace(".", "")
-    save_path = output_dir / f"{safe_filename}.flac"
+    save_path = output_dir / f"audio-{datetime.now().strftime('%Y%m%d_%H%M%S')}.flac"
     torchaudio.save(save_path, audio, seq_cfg.sampling_rate)
     log.info(f"Audio saved to {save_path}")
     log.info("Memory usage: %.2f GB", torch.cuda.max_memory_allocated() / (2**30))
@@ -165,5 +180,52 @@ def run_inference(video_url: str):
     }
 
 
+@app.get("/api/v1/ping")
+async def ping() -> PingResponse:
+    """Health check endpoint."""
+    return PingResponse(status="ok", message="RhythmAI API is running")
+
+
+@app.post("/api/v1/gen")
+async def generate_audio(request: GenerateRequest):
+    """
+    Generate background music for a video.
+
+    Args:
+        request: JSON body containing video_url
+
+    Returns:
+        Audio file with prompt in response headers
+    """
+    try:
+        log.info(f"Received generation request for video: {request.video_url}")
+        result = run_inference(request.video_url)
+
+        audio_path = result["audio_path"]
+        prompt = result["prompt"]
+
+        # Return the audio file with prompt in headers
+        return FileResponse(
+            path=audio_path,
+            media_type="audio/flac",
+            filename="generated_audio.flac",
+            headers={
+                "X-Generated-Prompt": prompt,
+                "Content-Disposition": 'attachment; filename="generated_audio.flac"',
+            },
+        )
+    except Exception as e:
+        log.error(f"Error during audio generation: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Audio generation failed: {str(e)}"
+        )
+
+
 if __name__ == "__main__":
-    run_inference("https://i.imgur.com/8xHJTzI.mp4")
+    # For testing during development
+    # run_inference(
+    #     "https://wxoealemfuynenwgqazp.supabase.co/storage/v1/object/public/videos/videos/1763616154488-video.mp4"
+    # )
+
+    # Run the API server
+    uvicorn.run(app, host="0.0.0.0", port=8000)
