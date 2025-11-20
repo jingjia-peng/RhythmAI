@@ -6,9 +6,10 @@ from mmaudio.eval_utils import (
     all_model_cfg,
     generate,
     load_video,
-    make_video,
     setup_eval_logging,
 )
+import tempfile
+import requests
 import torchaudio
 import torch
 from pathlib import Path
@@ -71,24 +72,21 @@ def run_inference(video_url: str):
     setup_eval_logging()
 
     # small_16k, small_44k, medium_44k, large_44k, large_44k_v2
-    model: ModelConfig = all_model_cfg['large_44k_v2']
+    model: ModelConfig = all_model_cfg["large_44k_v2"]
     model.download_if_needed()
     seq_cfg = model.seq_cfg
 
     if video_url:
-        # download video to a temp file
-        import tempfile
-        import requests
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
             response = requests.get(video_url)
             tmp_file.write(response.content)
             tmp_file_path = tmp_file.name
-        video_path: Path = Path(tmp_file_path)
+        video_path: Path = Path(tmp_file_path).expanduser()
     else:
         video_path = None
 
     prompt: str = get_bgm_description(video_url) if video_url else ""
-    output_dir: str = Path('./output').expanduser()
+    output_dir: str = Path("./output").expanduser()
     seed: int = 42
     num_steps: int = 25
     duration: float = 8.0  # TODO: chagne to input video duration
@@ -127,17 +125,13 @@ def run_inference(video_url: str):
     )
     feature_utils = feature_utils.to(device, dtype).eval()
 
-    if video_path is not None:
-        log.info(f"Using video {video_path}")
-        video_info = load_video(video_path, duration)
-        clip_frames = video_info.clip_frames
-        sync_frames = video_info.sync_frames
-        duration = video_info.duration_sec
-        clip_frames = clip_frames.unsqueeze(0)
-        sync_frames = sync_frames.unsqueeze(0)
-    else:
-        log.info("No video provided -- text-to-audio mode")
-        clip_frames = sync_frames = None
+    log.info(f"Using video {video_path}")
+    video_info = load_video(video_path, duration)
+    clip_frames = video_info.clip_frames
+    sync_frames = video_info.sync_frames
+    duration = video_info.duration_sec
+    clip_frames = clip_frames.unsqueeze(0)
+    sync_frames = sync_frames.unsqueeze(0)
 
     seq_cfg.duration = duration
     net.update_seq_lengths(
@@ -157,31 +151,18 @@ def run_inference(video_url: str):
         cfg_strength=cfg_strength,
     )
     audio = audios.float().cpu()[0]
-    if video_path is not None:
-        save_path = output_dir / f"{video_path.stem}.flac"
-    else:
-        safe_filename = prompt.replace(
-            " ",
-            "_").replace(
-            "/",
-            "_").replace(
-            ".",
-            "")
-        save_path = output_dir / f"{safe_filename}.flac"
+    safe_filename = prompt.replace(" ", "_").replace("/", "_").replace(".", "")
+    save_path = output_dir / f"{safe_filename}.flac"
     torchaudio.save(save_path, audio, seq_cfg.sampling_rate)
+    log.info(f"Audio saved to {save_path}")
+    log.info("Memory usage: %.2f GB", torch.cuda.max_memory_allocated() / (2**30))
 
-    # log.info(f"Audio saved to {save_path}")
-    # if video_path is not None and:
-    #     video_save_path = output_dir / f"{video_path.stem}.mp4"
-    #     make_video(
-    #         video_info, video_save_path, audio, sampling_rate=seq_cfg.sampling_rate
-    #     )
-    #     log.info(f"Video saved to {output_dir / video_save_path}")
+    os.remove(video_path)
 
-    log.info("Memory usage: %.2f GB",
-             torch.cuda.max_memory_allocated() / (2**30))
-
-    return save_path
+    return {
+        "audio_path": save_path,
+        "prompt": prompt,
+    }
 
 
 if __name__ == "__main__":
