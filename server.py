@@ -20,12 +20,26 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+from supabase import create_client, Client
 
 load_dotenv()
 
 app = FastAPI(title="RhythmAI API", version="1.0.0")
+
+origins = [
+    "*",  # for development
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 prompt = """
 Provide a detailed description of the background music the video should feature. The musical description should cover the following five elements:
@@ -44,6 +58,13 @@ client = OpenAI(
     base_url=os.getenv("BASE_URL"),
 )
 
+# Supabase configuration
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# Create Supabase client
+supabase: Client = create_client(supabase_url=SUPABASE_URL, supabase_key=SUPABASE_KEY)
+
 
 class GenerateRequest(BaseModel):
     video_url: str
@@ -52,6 +73,11 @@ class GenerateRequest(BaseModel):
 class PingResponse(BaseModel):
     status: str
     message: str
+
+
+class GenerateResponse(BaseModel):
+    prompt: str
+    audio_url: str
 
 
 def get_bgm_description(video_url: str) -> str:
@@ -75,6 +101,49 @@ def get_bgm_description(video_url: str) -> str:
         ],
     )
     return completion.choices[0].message.content or ""
+
+
+def upload_audio_to_storage(audio_file_path: str) -> dict:
+    """
+    Upload audio file to Supabase Storage
+
+    Args:
+        audio_file_path: Local audio file path
+
+    Returns:
+        dict: Dictionary containing success, file_path, public_url
+    """
+    try:
+        # Read audio file
+        with open(audio_file_path, "rb") as f:
+            audio_data = f.read()
+
+        # Generate filename if not provided
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        original_filename = os.path.basename(audio_file_path)
+        upload_path = f"{timestamp}_{original_filename}"
+
+        # Upload to 'audios' bucket
+        response = supabase.storage.from_("audios").upload(
+            path=upload_path,
+            file=audio_data,
+            file_options={
+                "content-type": "audio/flac",
+                "upsert": "true",  # Overwrite if file exists
+            },
+        )
+
+        # Get public URL
+        public_url = supabase.storage.from_("audios").get_public_url(upload_path)
+
+        return {
+            "success": True,
+            "public_url": public_url,
+            "message": "Audio uploaded successfully",
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e), "message": "Audio upload failed"}
 
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -186,7 +255,7 @@ async def ping() -> PingResponse:
     return PingResponse(status="ok", message="RhythmAI API is running")
 
 
-@app.post("/api/v1/gen")
+@app.post("/api/v1/gen", response_model=GenerateResponse)
 async def generate_audio(request: GenerateRequest):
     """
     Generate background music for a video.
@@ -195,7 +264,7 @@ async def generate_audio(request: GenerateRequest):
         request: JSON body containing video_url
 
     Returns:
-        Audio file with prompt in response headers
+        JSON response with prompt and audio file URL from Supabase
     """
     try:
         log.info(f"Received generation request for video: {request.video_url}")
@@ -204,16 +273,29 @@ async def generate_audio(request: GenerateRequest):
         audio_path = result["audio_path"]
         prompt = result["prompt"]
 
-        # Return the audio file with prompt in headers
-        return FileResponse(
-            path=audio_path,
-            media_type="audio/flac",
-            filename="generated_audio.flac",
-            headers={
-                "X-Generated-Prompt": prompt,
-                "Content-Disposition": 'attachment; filename="generated_audio.flac"',
-            },
+        # Upload audio to Supabase
+        log.info(f"Uploading audio to Supabase: {audio_path}")
+        upload_result = upload_audio_to_storage(audio_path)
+
+        if not upload_result["success"]:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Audio upload failed: {upload_result.get('error', 'Unknown error')}",
+            )
+
+        # Clean up local file after successful upload
+        try:
+            os.remove(audio_path)
+            log.info(f"Cleaned up local audio file: {audio_path}")
+        except Exception as e:
+            log.warning(f"Failed to clean up local file {audio_path}: {str(e)}")
+
+        # Return JSON response with prompt and URL
+        return GenerateResponse(
+            prompt=prompt,
+            audio_url=upload_result["public_url"],
         )
+
     except Exception as e:
         log.error(f"Error during audio generation: {str(e)}")
         raise HTTPException(
