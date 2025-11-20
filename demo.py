@@ -32,9 +32,7 @@ def main():
     parser.add_argument('--duration', type=float, default=8.0)
     parser.add_argument('--cfg_strength', type=float, default=4.5)
     parser.add_argument('--num_steps', type=int, default=25)
-
     parser.add_argument('--mask_away_clip', action='store_true')
-
     parser.add_argument('--output', type=Path, help='Output directory', default='./output')
     parser.add_argument('--seed', type=int, help='Random seed', default=42)
     parser.add_argument('--skip_video_composite', action='store_true')
