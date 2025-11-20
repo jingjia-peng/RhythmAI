@@ -10,6 +10,7 @@ from mmaudio.eval_utils import (
 )
 import tempfile
 import requests
+from datetime import datetime
 import torchaudio
 import torch
 from pathlib import Path
@@ -151,8 +152,7 @@ def run_inference(video_url: str):
         cfg_strength=cfg_strength,
     )
     audio = audios.float().cpu()[0]
-    safe_filename = prompt.replace(" ", "_").replace("/", "_").replace(".", "")
-    save_path = output_dir / f"{safe_filename}.flac"
+    save_path = output_dir / f"audio-{datetime.now().strftime('%Y%m%d_%H%M%S')}.flac"
     torchaudio.save(save_path, audio, seq_cfg.sampling_rate)
     log.info(f"Audio saved to {save_path}")
     log.info("Memory usage: %.2f GB", torch.cuda.max_memory_allocated() / (2**30))
@@ -166,4 +166,4 @@ def run_inference(video_url: str):
 
 
 if __name__ == "__main__":
-    run_inference("https://i.imgur.com/8xHJTzI.mp4")
+    run_inference("https://wxoealemfuynenwgqazp.supabase.co/storage/v1/object/public/videos/videos/1763616154488-video.mp4")
