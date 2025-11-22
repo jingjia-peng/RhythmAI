@@ -16,14 +16,19 @@ import torch
 from pathlib import Path
 import logging
 import os
+import random
 from openai import OpenAI
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 from supabase import create_client, Client
+import av
+import uuid
+import asyncio
+from typing import Optional
+from enum import Enum
 
 load_dotenv()
 
@@ -76,8 +81,26 @@ class PingResponse(BaseModel):
 
 
 class GenerateResponse(BaseModel):
-    prompt: str
-    audio_url: str
+    job_id: str
+
+
+class JobStatusEnum(str, Enum):
+    pending = "pending"
+    processing = "processing"
+    completed = "completed"
+    failed = "failed"
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: JobStatusEnum
+    prompt: Optional[str] = None
+    audio_url: Optional[str] = None
+    error: Optional[str] = None
+
+
+# In-memory job storage
+jobs_db = {}
 
 
 def get_bgm_description(video_url: str) -> str:
@@ -152,6 +175,27 @@ torch.backends.cudnn.allow_tf32 = True
 log = logging.getLogger()
 
 
+def get_video_duration(video_path: Path, fallback: float = 10.0) -> float:
+    try:
+        with av.open(str(video_path)) as container:
+            duration = None
+            video_stream = next(
+                (s for s in container.streams if s.type == "video"), None
+            )
+            if video_stream is not None:
+                if video_stream.duration and video_stream.time_base:
+                    duration = float(video_stream.duration * video_stream.time_base)
+                elif video_stream.frames and video_stream.average_rate:
+                    duration = float(video_stream.frames / video_stream.average_rate)
+            if duration is None and container.duration:
+                duration = float(container.duration * av.time_base)
+            if duration is not None and duration > 0:
+                return duration
+    except Exception as exc:
+        log.warning("Unable to determine video duration for %s: %s", video_path, exc)
+    return fallback
+
+
 @torch.inference_mode()
 def run_inference(video_url: str):
     setup_eval_logging()
@@ -170,11 +214,11 @@ def run_inference(video_url: str):
     else:
         video_path = None
 
+    duration: float = get_video_duration(video_path) if video_path else 10.0
     prompt: str = get_bgm_description(video_url) if video_url else ""
     output_dir: str = Path("./output").expanduser()
-    seed: int = 42
+    seed: int = random.randint(0, 1000)
     num_steps: int = 25
-    duration: float = 8.0  # TODO: chagne to input video duration
     cfg_strength: float = 4.5
 
     device = "cpu"
@@ -255,52 +299,120 @@ async def ping() -> PingResponse:
     return PingResponse(status="ok", message="RhythmAI API is running")
 
 
-@app.post("/api/v1/gen", response_model=GenerateResponse)
-async def generate_audio(request: GenerateRequest):
+async def process_generation_job(job_id: str, video_url: str):
     """
-    Generate background music for a video.
+    Background task to process audio generation.
 
     Args:
-        request: JSON body containing video_url
-
-    Returns:
-        JSON response with prompt and audio file URL from Supabase
+        job_id: Unique job identifier
+        video_url: URL of the video to process
     """
     try:
-        log.info(f"Received generation request for video: {request.video_url}")
-        result = run_inference(request.video_url)
+        # Update status to processing
+        jobs_db[job_id]["status"] = JobStatusEnum.processing
+        log.info(f"Job {job_id}: Starting processing for video: {video_url}")
+
+        # Run inference in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, run_inference, video_url)
 
         audio_path = result["audio_path"]
         prompt = result["prompt"]
 
         # Upload audio to Supabase
-        log.info(f"Uploading audio to Supabase: {audio_path}")
-        upload_result = upload_audio_to_storage(audio_path)
+        log.info(f"Job {job_id}: Uploading audio to Supabase: {audio_path}")
+        upload_result = await loop.run_in_executor(
+            None, upload_audio_to_storage, audio_path
+        )
 
         if not upload_result["success"]:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Audio upload failed: {upload_result.get('error', 'Unknown error')}",
+            raise Exception(
+                f"Audio upload failed: {upload_result.get('error', 'Unknown error')}"
             )
 
         # Clean up local file after successful upload
         try:
             os.remove(audio_path)
-            log.info(f"Cleaned up local audio file: {audio_path}")
+            log.info(f"Job {job_id}: Cleaned up local audio file: {audio_path}")
         except Exception as e:
-            log.warning(f"Failed to clean up local file {audio_path}: {str(e)}")
+            log.warning(
+                f"Job {job_id}: Failed to clean up local file {audio_path}: {str(e)}"
+            )
 
-        # Return JSON response with prompt and URL
-        return GenerateResponse(
-            prompt=prompt,
-            audio_url=upload_result["public_url"],
-        )
+        # Update job status to completed
+        jobs_db[job_id]["status"] = JobStatusEnum.completed
+        jobs_db[job_id]["prompt"] = prompt
+        jobs_db[job_id]["audio_url"] = upload_result["public_url"]
+        log.info(f"Job {job_id}: Completed successfully")
 
     except Exception as e:
-        log.error(f"Error during audio generation: {str(e)}")
+        log.error(f"Job {job_id}: Error during audio generation: {str(e)}")
+        jobs_db[job_id]["status"] = JobStatusEnum.failed
+        jobs_db[job_id]["error"] = str(e)
+
+
+@app.post("/api/v1/gen", response_model=GenerateResponse)
+async def generate_audio(request: GenerateRequest):
+    """
+    Start background music generation for a video.
+
+    Args:
+        request: JSON body containing video_url
+
+    Returns:
+        JSON response with job_id to query for results
+    """
+    try:
+        # Generate unique job ID
+        job_id = str(uuid.uuid4())
+
+        # Initialize job in database
+        jobs_db[job_id] = {
+            "status": JobStatusEnum.pending,
+            "video_url": request.video_url,
+            "prompt": None,
+            "audio_url": None,
+            "error": None,
+        }
+
+        log.info(f"Created job {job_id} for video: {request.video_url}")
+
+        # Start background task
+        asyncio.create_task(process_generation_job(job_id, request.video_url))
+
+        # Return job_id immediately
+        return GenerateResponse(job_id=job_id)
+
+    except Exception as e:
+        log.error(f"Error creating generation job: {str(e)}")
         raise HTTPException(
-            status_code=500, detail=f"Audio generation failed: {str(e)}"
+            status_code=500, detail=f"Failed to create generation job: {str(e)}"
         )
+
+
+@app.get("/api/v1/job/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str):
+    """
+    Get the status and result of a generation job.
+
+    Args:
+        job_id: The unique job identifier
+
+    Returns:
+        JSON response with job status, and prompt/audio_url if completed
+    """
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    job = jobs_db[job_id]
+
+    return JobStatusResponse(
+        job_id=job_id,
+        status=job["status"],
+        prompt=job.get("prompt"),
+        audio_url=job.get("audio_url"),
+        error=job.get("error"),
+    )
 
 
 if __name__ == "__main__":
