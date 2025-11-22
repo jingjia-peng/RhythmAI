@@ -77,6 +77,11 @@ class GenerateRequest(BaseModel):
     user_request: str
 
 
+class MergeRequest(BaseModel):
+    video_url: str
+    audio_url: str
+
+
 class PingResponse(BaseModel):
     status: str
     message: str
@@ -84,6 +89,10 @@ class PingResponse(BaseModel):
 
 class GenerateResponse(BaseModel):
     job_id: str
+
+
+class MergeResponse(BaseModel):
+    video_url: str
 
 
 class JobStatusEnum(str, Enum):
@@ -176,6 +185,126 @@ def upload_audio_to_storage(audio_file_path: str) -> dict:
 
     except Exception as e:
         return {"success": False, "error": str(e), "message": "Audio upload failed"}
+
+
+def upload_video_to_storage(video_file_path: str) -> dict:
+    """
+    Upload video file to Supabase Storage
+
+    Args:
+        video_file_path: Local video file path
+
+    Returns:
+        dict: Dictionary containing success, file_path, public_url
+    """
+    try:
+        # Read video file
+        with open(video_file_path, "rb") as f:
+            video_data = f.read()
+
+        original_filename = os.path.basename(video_file_path)
+        upload_path = f"merged_{original_filename}"
+
+        # Upload to 'videos' bucket
+        response = supabase.storage.from_("videos").upload(
+            path=upload_path,
+            file=video_data,
+            file_options={
+                "content-type": "video/mp4",
+                "upsert": "true",  # Overwrite if file exists
+            },
+        )
+
+        # Get public URL
+        public_url = supabase.storage.from_("videos").get_public_url(upload_path)
+
+        return {
+            "success": True,
+            "public_url": public_url,
+            "message": "Video uploaded successfully",
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e), "message": "Video upload failed"}
+
+
+def merge_video_audio(video_url: str, audio_url: str) -> str:
+    """
+    Merge video and audio files using ffmpeg
+
+    Args:
+        video_url: URL of the video file
+        audio_url: URL of the audio file
+
+    Returns:
+        str: Path to the merged video file
+    """
+    import subprocess
+
+    # Download video
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_video:
+        response = requests.get(video_url)
+        tmp_video.write(response.content)
+        video_path = tmp_video.name
+
+    # Download audio
+    with tempfile.NamedTemporaryFile(suffix=".flac", delete=False) as tmp_audio:
+        response = requests.get(audio_url)
+        tmp_audio.write(response.content)
+        audio_path = tmp_audio.name
+
+    # Create output path
+    output_path = tempfile.NamedTemporaryFile(
+        suffix=".mp4", delete=False, dir=Path("./output")
+    ).name
+
+    try:
+        # Use ffmpeg to merge video and audio
+        # -i: input files
+        # -c:v copy: copy video codec (no re-encoding)
+        # -c:a aac: encode audio to AAC
+        # -map 0:v:0: use video from first input
+        # -map 1:a:0: use audio from second input
+        # -shortest: finish encoding when shortest input ends
+        # -y: overwrite output file if exists
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-i",
+                video_path,
+                "-i",
+                audio_path,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-shortest",
+                "-y",
+                output_path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        log.info(f"Successfully merged video and audio to {output_path}")
+        return output_path
+
+    except subprocess.CalledProcessError as e:
+        log.error(f"FFmpeg error: {e.stderr.decode()}")
+        raise Exception(f"Failed to merge video and audio: {e.stderr.decode()}")
+    finally:
+        # Clean up temporary files
+        try:
+            os.remove(video_path)
+            os.remove(audio_path)
+        except Exception as e:
+            log.warning(f"Failed to clean up temporary files: {str(e)}")
 
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -385,7 +514,7 @@ async def process_generation_job(job_id: str, video_url: str, user_request: str)
         jobs_db[job_id]["status"] = JobStatusEnum.processing
         log.info(f"Job {job_id}: Starting processing for video: {video_url}")
 
-        # Run 3 inferences in parallel
+        # Run 2 inferences in parallel
         tasks = [
             process_single_inference(job_id, video_url, user_request, 0),
             process_single_inference(job_id, video_url, user_request, 1),
@@ -398,7 +527,7 @@ async def process_generation_job(job_id: str, video_url: str, user_request: str)
         if not successful_results:
             # All inferences failed
             jobs_db[job_id]["status"] = JobStatusEnum.failed
-            jobs_db[job_id]["error"] = "All 3 inference tasks failed"
+            jobs_db[job_id]["error"] = "All 2 inference tasks failed"
             log.error(f"Job {job_id}: All inference tasks failed")
         else:
             # At least one succeeded
@@ -406,7 +535,7 @@ async def process_generation_job(job_id: str, video_url: str, user_request: str)
             jobs_db[job_id]["results"] = successful_results
             jobs_db[job_id]["completed_count"] = len(successful_results)
             log.info(
-                f"Job {job_id}: Completed with {len(successful_results)}/3 successful results"
+                f"Job {job_id}: Completed with {len(successful_results)}/2 successful results"
             )
 
     except Exception as e:
@@ -482,6 +611,55 @@ async def get_job_status(job_id: str):
         results=[AudioResult(**r) for r in job.get("results", [])],
         error=job.get("error"),
     )
+
+
+@app.post("/api/v1/merge", response_model=MergeResponse)
+async def merge_video_and_audio(request: MergeRequest):
+    """
+    Merge video and audio files, then upload to Supabase.
+
+    Args:
+        request: JSON body containing video_url and audio_url
+
+    Returns:
+        JSON response with the URL of the merged video
+    """
+    try:
+        log.info(f"Merging video {request.video_url} with audio {request.audio_url}")
+
+        # Run merge in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        merged_video_path = await loop.run_in_executor(
+            None, merge_video_audio, request.video_url, request.audio_url
+        )
+
+        # Upload merged video to Supabase
+        log.info(f"Uploading merged video to Supabase: {merged_video_path}")
+        upload_result = await loop.run_in_executor(
+            None, upload_video_to_storage, merged_video_path
+        )
+
+        if not upload_result["success"]:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Video upload failed: {upload_result.get('error', 'Unknown error')}",
+            )
+
+        # Clean up local file after successful upload
+        try:
+            os.remove(merged_video_path)
+            log.info(f"Cleaned up local merged video file: {merged_video_path}")
+        except Exception as e:
+            log.warning(f"Failed to clean up local file {merged_video_path}: {str(e)}")
+
+        log.info(
+            f"Successfully merged and uploaded video: {upload_result['public_url']}"
+        )
+        return MergeResponse(video_url=upload_result["public_url"])
+
+    except Exception as e:
+        log.error(f"Error during video/audio merge: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Video merge failed: {str(e)}")
 
 
 if __name__ == "__main__":
