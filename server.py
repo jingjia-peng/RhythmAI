@@ -47,7 +47,7 @@ app.add_middleware(
 )
 
 prompt = """
-Provide a detailed description of the background music the video should feature. The musical description should cover the following five elements:
+Provide a detailed description of the background music the video should feature based on user's request. The musical description should cover the following five elements:
 
 1.  **Genre and Style:** Suggest a specific genre (e.g., Lo-Fi, Cinematic Orchestral, Acoustic Folk, Synthwave).
 2.  **Instrumentation:** Specify the core instruments (e.g., "Main melody on piano with a cello backing," "Simple drum loop with ambient synth pads," "Acoustic guitar and light percussion").
@@ -55,6 +55,7 @@ Provide a detailed description of the background music the video should feature.
 4.  **Mood and Key:** State the emotional effect and suggest a musical key (e.g., "The mood should be hopeful and slightly melancholic, suggesting a minor key like C minor.").
 5.  **Placement Notes:** Provide guidance on where the music should be most prominent or subtle (e.g. "Use a climactic chord progression for the final 15 seconds.").
 
+User's request: {user_request}
 Output background music description in English.
 """
 
@@ -73,6 +74,7 @@ supabase: Client = create_client(supabase_url=SUPABASE_URL, supabase_key=SUPABAS
 
 class GenerateRequest(BaseModel):
     video_url: str
+    user_request: str
 
 
 class PingResponse(BaseModel):
@@ -91,11 +93,18 @@ class JobStatusEnum(str, Enum):
     failed = "failed"
 
 
+class AudioResult(BaseModel):
+    prompt: str
+    audio_url: str
+    index: int
+
+
 class JobStatusResponse(BaseModel):
     job_id: str
     status: JobStatusEnum
-    prompt: Optional[str] = None
-    audio_url: Optional[str] = None
+    completed_count: int
+    total_count: int
+    results: list[AudioResult] = []
     error: Optional[str] = None
 
 
@@ -103,15 +112,15 @@ class JobStatusResponse(BaseModel):
 jobs_db = {}
 
 
-def get_bgm_description(video_url: str) -> str:
+def get_bgm_description(video_url: str, user_request: str) -> str:
     completion = client.chat.completions.create(
         model="ernie-4.5-vl-28b-a3b",
-        temperature=0.6,
+        temperature=0.8,
         messages=[
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": prompt.format(user_request=user_request)},
                     {
                         "type": "video_url",
                         "video_url": {
@@ -197,7 +206,7 @@ def get_video_duration(video_path: Path, fallback: float = 10.0) -> float:
 
 
 @torch.inference_mode()
-def run_inference(video_url: str):
+def run_inference(video_url: str, user_request: str, index: int):
     setup_eval_logging()
 
     # small_16k, small_44k, medium_44k, large_44k, large_44k_v2
@@ -215,7 +224,7 @@ def run_inference(video_url: str):
         video_path = None
 
     duration: float = get_video_duration(video_path) if video_path else 10.0
-    prompt: str = get_bgm_description(video_url) if video_url else ""
+    prompt: str = get_bgm_description(video_url, user_request) if video_url else ""
     output_dir: str = Path("./output").expanduser()
     seed: int = random.randint(0, 1000)
     num_steps: int = 25
@@ -280,7 +289,9 @@ def run_inference(video_url: str):
         cfg_strength=cfg_strength,
     )
     audio = audios.float().cpu()[0]
-    save_path = output_dir / f"audio-{datetime.now().strftime('%Y%m%d_%H%M%S')}.flac"
+    save_path = (
+        output_dir / f"audio-{datetime.now().strftime('%Y%m%d_%H%M%S')}-{index}.flac"
+    )
     torchaudio.save(save_path, audio, seq_cfg.sampling_rate)
     log.info(f"Audio saved to {save_path}")
     log.info("Memory usage: %.2f GB", torch.cuda.max_memory_allocated() / (2**30))
@@ -299,28 +310,35 @@ async def ping() -> PingResponse:
     return PingResponse(status="ok", message="RhythmAI API is running")
 
 
-async def process_generation_job(job_id: str, video_url: str):
+async def process_single_inference(
+    job_id: str, video_url: str, user_request: str, index: int
+):
     """
-    Background task to process audio generation.
+    Process a single inference task.
 
     Args:
         job_id: Unique job identifier
         video_url: URL of the video to process
+        user_request: User's music description request
+        index: Index of this inference (0-2)
+
+    Returns:
+        dict with prompt and audio_url, or None if failed
     """
     try:
-        # Update status to processing
-        jobs_db[job_id]["status"] = JobStatusEnum.processing
-        log.info(f"Job {job_id}: Starting processing for video: {video_url}")
+        log.info(f"Job {job_id} [#{index}]: Starting inference")
 
         # Run inference in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, run_inference, video_url)
+        result = await loop.run_in_executor(
+            None, run_inference, video_url, user_request, index
+        )
 
         audio_path = result["audio_path"]
         prompt = result["prompt"]
 
         # Upload audio to Supabase
-        log.info(f"Job {job_id}: Uploading audio to Supabase: {audio_path}")
+        log.info(f"Job {job_id} [#{index}]: Uploading audio to Supabase: {audio_path}")
         upload_result = await loop.run_in_executor(
             None, upload_audio_to_storage, audio_path
         )
@@ -333,17 +351,63 @@ async def process_generation_job(job_id: str, video_url: str):
         # Clean up local file after successful upload
         try:
             os.remove(audio_path)
-            log.info(f"Job {job_id}: Cleaned up local audio file: {audio_path}")
+            log.info(
+                f"Job {job_id} [#{index}]: Cleaned up local audio file: {audio_path}"
+            )
         except Exception as e:
             log.warning(
-                f"Job {job_id}: Failed to clean up local file {audio_path}: {str(e)}"
+                f"Job {job_id} [#{index}]: Failed to clean up local file {audio_path}: {str(e)}"
             )
 
-        # Update job status to completed
-        jobs_db[job_id]["status"] = JobStatusEnum.completed
-        jobs_db[job_id]["prompt"] = prompt
-        jobs_db[job_id]["audio_url"] = upload_result["public_url"]
-        log.info(f"Job {job_id}: Completed successfully")
+        log.info(f"Job {job_id} [#{index}]: Completed successfully")
+        return {
+            "prompt": prompt,
+            "audio_url": upload_result["public_url"],
+            "index": index,
+        }
+
+    except Exception as e:
+        log.error(f"Job {job_id} [#{index}]: Error during audio generation: {str(e)}")
+        return None
+
+
+async def process_generation_job(job_id: str, video_url: str, user_request: str):
+    """
+    Background task to process audio generation with 3 parallel inferences.
+
+    Args:
+        job_id: Unique job identifier
+        video_url: URL of the video to process
+        user_request: User's music description request
+    """
+    try:
+        # Update status to processing
+        jobs_db[job_id]["status"] = JobStatusEnum.processing
+        log.info(f"Job {job_id}: Starting processing for video: {video_url}")
+
+        # Run 3 inferences in parallel
+        tasks = [
+            process_single_inference(job_id, video_url, user_request, 0),
+            process_single_inference(job_id, video_url, user_request, 1),
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        # Filter out None results (failed inferences)
+        successful_results = [r for r in results if r is not None]
+
+        if not successful_results:
+            # All inferences failed
+            jobs_db[job_id]["status"] = JobStatusEnum.failed
+            jobs_db[job_id]["error"] = "All 3 inference tasks failed"
+            log.error(f"Job {job_id}: All inference tasks failed")
+        else:
+            # At least one succeeded
+            jobs_db[job_id]["status"] = JobStatusEnum.completed
+            jobs_db[job_id]["results"] = successful_results
+            jobs_db[job_id]["completed_count"] = len(successful_results)
+            log.info(
+                f"Job {job_id}: Completed with {len(successful_results)}/3 successful results"
+            )
 
     except Exception as e:
         log.error(f"Job {job_id}: Error during audio generation: {str(e)}")
@@ -354,10 +418,10 @@ async def process_generation_job(job_id: str, video_url: str):
 @app.post("/api/v1/gen", response_model=GenerateResponse)
 async def generate_audio(request: GenerateRequest):
     """
-    Start background music generation for a video.
+    Start background music generation for a video with 3 parallel inferences.
 
     Args:
-        request: JSON body containing video_url
+        request: JSON body containing video_url and user_request
 
     Returns:
         JSON response with job_id to query for results
@@ -370,15 +434,19 @@ async def generate_audio(request: GenerateRequest):
         jobs_db[job_id] = {
             "status": JobStatusEnum.pending,
             "video_url": request.video_url,
-            "prompt": None,
-            "audio_url": None,
+            "user_request": request.user_request,
+            "results": [],
+            "completed_count": 0,
+            "total_count": 2,
             "error": None,
         }
 
         log.info(f"Created job {job_id} for video: {request.video_url}")
 
-        # Start background task
-        asyncio.create_task(process_generation_job(job_id, request.video_url))
+        # Start background task with 2 parallel inferences
+        asyncio.create_task(
+            process_generation_job(job_id, request.video_url, request.user_request)
+        )
 
         # Return job_id immediately
         return GenerateResponse(job_id=job_id)
@@ -393,13 +461,13 @@ async def generate_audio(request: GenerateRequest):
 @app.get("/api/v1/job/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(job_id: str):
     """
-    Get the status and result of a generation job.
+    Get the status and results of a generation job (2 parallel inferences).
 
     Args:
         job_id: The unique job identifier
 
     Returns:
-        JSON response with job status, and prompt/audio_url if completed
+        JSON response with job status and list of completed audio results
     """
     if job_id not in jobs_db:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
@@ -409,8 +477,9 @@ async def get_job_status(job_id: str):
     return JobStatusResponse(
         job_id=job_id,
         status=job["status"],
-        prompt=job.get("prompt"),
-        audio_url=job.get("audio_url"),
+        completed_count=job.get("completed_count", 0),
+        total_count=job.get("total_count", 2),
+        results=[AudioResult(**r) for r in job.get("results", [])],
         error=job.get("error"),
     )
 
