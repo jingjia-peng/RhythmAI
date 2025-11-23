@@ -120,6 +120,27 @@ class JobStatusResponse(BaseModel):
 # In-memory job storage
 jobs_db = {}
 
+# Maximum number of jobs to keep in memory (to prevent memory growth)
+MAX_JOBS_IN_MEMORY = 100
+
+
+def cleanup_old_jobs():
+    """Remove old completed/failed jobs if we exceed MAX_JOBS_IN_MEMORY."""
+    if len(jobs_db) > MAX_JOBS_IN_MEMORY:
+        # Sort by creation time (job_id is uuid, so we can't sort by that)
+        # Instead, keep only the most recent MAX_JOBS_IN_MEMORY jobs
+        completed_or_failed = [
+            job_id
+            for job_id, job in jobs_db.items()
+            if job["status"] in [JobStatusEnum.completed, JobStatusEnum.failed]
+        ]
+        # Remove oldest jobs
+        jobs_to_remove = len(completed_or_failed) - (MAX_JOBS_IN_MEMORY // 2)
+        if jobs_to_remove > 0:
+            for job_id in completed_or_failed[:jobs_to_remove]:
+                del jobs_db[job_id]
+                log.info(f"Cleaned up old job {job_id} from memory")
+
 
 def get_bgm_description(video_url: str, user_request: str) -> str:
     completion = client.chat.completions.create(
@@ -312,6 +333,76 @@ torch.backends.cudnn.allow_tf32 = True
 
 log = logging.getLogger()
 
+# Global model instances (load once, reuse for all requests)
+_model_lock = asyncio.Lock()
+_models_loaded = False
+_net = None
+_feature_utils = None
+_fm = None
+_seq_cfg = None
+_model_device = None
+_model_dtype = None
+
+
+async def load_models_once():
+    """Load models once and reuse them for all requests."""
+    global _models_loaded, _net, _feature_utils, _fm, _seq_cfg, _model_device, _model_dtype
+
+    async with _model_lock:
+        if _models_loaded:
+            log.info("Models already loaded, skipping initialization")
+            return
+
+        log.info("Loading models for the first time...")
+        setup_eval_logging()
+
+        # Model configuration
+        model: ModelConfig = all_model_cfg["large_44k_v2"]
+        model.download_if_needed()
+        _seq_cfg = model.seq_cfg
+
+        # Device setup
+        if torch.cuda.is_available():
+            _model_device = "cuda"
+        elif torch.backends.mps.is_available():
+            _model_device = "mps"
+        else:
+            _model_device = "cpu"
+            log.warning("CUDA/MPS are not available, running on CPU")
+        _model_dtype = torch.bfloat16
+
+        # Load MMAudio model
+        _net = get_my_mmaudio(model.model_name).to(_model_device, _model_dtype).eval()
+        _net.load_weights(
+            torch.load(model.model_path, map_location=_model_device, weights_only=True)
+        )
+        log.info(f"Loaded MMAudio weights from {model.model_path}")
+
+        # Load feature extraction models
+        _feature_utils = FeaturesUtils(
+            tod_vae_ckpt=model.vae_path,
+            synchformer_ckpt=model.synchformer_ckpt,
+            enable_conditions=True,
+            mode=model.mode,
+            bigvgan_vocoder_ckpt=model.bigvgan_16k_path,
+            need_vae_encoder=False,
+        )
+        _feature_utils = _feature_utils.to(_model_device, _model_dtype).eval()
+        log.info("Loaded FeaturesUtils (CLIP, Synchformer, VAE, vocoder)")
+
+        # Initialize flow matching
+        _fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=25)
+
+        _models_loaded = True
+        log.info(f"All models loaded successfully on {_model_device}")
+
+        # Clear any initialization memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            log.info(
+                f"Initial memory usage: {torch.cuda.memory_allocated() / (2**30):.2f} GB"
+            )
+
 
 def get_video_duration(video_path: Path, fallback: float = 10.0) -> float:
     try:
@@ -336,13 +427,18 @@ def get_video_duration(video_path: Path, fallback: float = 10.0) -> float:
 
 @torch.inference_mode()
 def run_inference(video_url: str, user_request: str, index: int):
-    setup_eval_logging()
+    """
+    Run inference using pre-loaded global models.
 
-    # small_16k, small_44k, medium_44k, large_44k, large_44k_v2
-    model: ModelConfig = all_model_cfg["large_44k_v2"]
-    model.download_if_needed()
-    seq_cfg = model.seq_cfg
+    This function now reuses global model instances instead of loading new ones,
+    which prevents OOM issues from multiple model loads.
+    """
+    global _net, _feature_utils, _fm, _seq_cfg, _model_device, _model_dtype
 
+    if not _models_loaded:
+        raise RuntimeError("Models not loaded. Call load_models_once() first.")
+
+    # Download and process video
     if video_url:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
             response = requests.get(video_url)
@@ -352,85 +448,79 @@ def run_inference(video_url: str, user_request: str, index: int):
     else:
         video_path = None
 
-    duration: float = get_video_duration(video_path) if video_path else 10.0
-    prompt: str = get_bgm_description(video_url, user_request) if video_url else ""
-    output_dir: str = Path("./output").expanduser()
-    seed: int = random.randint(0, 1000)
-    num_steps: int = 25
-    cfg_strength: float = 4.5
+    try:
+        duration: float = get_video_duration(video_path) if video_path else 10.0
+        prompt: str = get_bgm_description(video_url, user_request) if video_url else ""
+        output_dir: Path = Path("./output").expanduser()
+        seed: int = random.randint(0, 1000)
+        cfg_strength: float = 4.5
 
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif torch.backends.mps.is_available():
-        device = "mps"
-    else:
-        log.warning("CUDA/MPS are not available, running on CPU")
-    dtype = torch.bfloat16
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+        # Use pre-loaded models
+        rng = torch.Generator(device=_model_device)
+        rng.manual_seed(seed)
 
-    # load a pretrained model
-    net: MMAudio = get_my_mmaudio(model.model_name).to(device, dtype).eval()
-    net.load_weights(
-        torch.load(model.model_path, map_location=device, weights_only=True)
-    )
-    log.info(f"Loaded weights from {model.model_path}")
+        log.info(f"Using video {video_path}")
+        video_info = load_video(video_path, duration)
+        clip_frames = video_info.clip_frames
+        sync_frames = video_info.sync_frames
+        duration = video_info.duration_sec
+        clip_frames = clip_frames.unsqueeze(0)
+        sync_frames = sync_frames.unsqueeze(0)
 
-    # misc setup
-    rng = torch.Generator(device=device)
-    rng.manual_seed(seed)
-    fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=num_steps)
+        # Update sequence lengths for this specific video duration
+        _seq_cfg.duration = duration
+        _net.update_seq_lengths(
+            _seq_cfg.latent_seq_len, _seq_cfg.clip_seq_len, _seq_cfg.sync_seq_len
+        )
 
-    feature_utils = FeaturesUtils(
-        tod_vae_ckpt=model.vae_path,
-        synchformer_ckpt=model.synchformer_ckpt,
-        enable_conditions=True,
-        mode=model.mode,
-        bigvgan_vocoder_ckpt=model.bigvgan_16k_path,
-        need_vae_encoder=False,
-    )
-    feature_utils = feature_utils.to(device, dtype).eval()
+        log.info(f"Prompt: {prompt}")
 
-    log.info(f"Using video {video_path}")
-    video_info = load_video(video_path, duration)
-    clip_frames = video_info.clip_frames
-    sync_frames = video_info.sync_frames
-    duration = video_info.duration_sec
-    clip_frames = clip_frames.unsqueeze(0)
-    sync_frames = sync_frames.unsqueeze(0)
+        # Generate audio using pre-loaded models
+        audios = generate(
+            clip_frames,
+            sync_frames,
+            [prompt],
+            feature_utils=_feature_utils,
+            net=_net,
+            fm=_fm,
+            rng=rng,
+            cfg_strength=cfg_strength,
+        )
+        audio = audios.float().cpu()[0]
+        save_path = (
+            output_dir
+            / f"audio-{datetime.now().strftime('%Y%m%d_%H%M%S')}-{index}.flac"
+        )
+        torchaudio.save(save_path, audio, _seq_cfg.sampling_rate)
+        log.info(f"Audio saved to {save_path}")
 
-    seq_cfg.duration = duration
-    net.update_seq_lengths(
-        seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len
-    )
+        # Clean up GPU memory after inference
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            log.info("Memory usage: %.2f GB", torch.cuda.memory_allocated() / (2**30))
 
-    log.info(f"Prompt: {prompt}")
+        return {
+            "audio_path": save_path,
+            "prompt": prompt,
+        }
 
-    audios = generate(
-        clip_frames,
-        sync_frames,
-        [prompt],
-        feature_utils=feature_utils,
-        net=net,
-        fm=fm,
-        rng=rng,
-        cfg_strength=cfg_strength,
-    )
-    audio = audios.float().cpu()[0]
-    save_path = (
-        output_dir / f"audio-{datetime.now().strftime('%Y%m%d_%H%M%S')}-{index}.flac"
-    )
-    torchaudio.save(save_path, audio, seq_cfg.sampling_rate)
-    log.info(f"Audio saved to {save_path}")
-    log.info("Memory usage: %.2f GB", torch.cuda.max_memory_allocated() / (2**30))
+    finally:
+        # Always clean up temporary video file
+        if video_path and os.path.exists(video_path):
+            try:
+                os.remove(video_path)
+            except Exception as e:
+                log.warning(f"Failed to remove temporary video file {video_path}: {e}")
 
-    os.remove(video_path)
 
-    return {
-        "audio_path": save_path,
-        "prompt": prompt,
-    }
+@app.on_event("startup")
+async def startup_event():
+    """Load models when the server starts."""
+    log.info("Server starting up, loading models...")
+    await load_models_once()
+    log.info("Server startup complete, models ready")
 
 
 @app.get("/api/v1/ping")
@@ -502,7 +592,10 @@ async def process_single_inference(
 
 async def process_generation_job(job_id: str, video_url: str, user_request: str):
     """
-    Background task to process audio generation with 3 parallel inferences.
+    Background task to process audio generation with 2 sequential inferences.
+
+    Changed from parallel to sequential execution to prevent OOM from loading
+    multiple model instances simultaneously.
 
     Args:
         job_id: Unique job identifier
@@ -514,15 +607,15 @@ async def process_generation_job(job_id: str, video_url: str, user_request: str)
         jobs_db[job_id]["status"] = JobStatusEnum.processing
         log.info(f"Job {job_id}: Starting processing for video: {video_url}")
 
-        # Run 2 inferences in parallel
-        tasks = [
-            process_single_inference(job_id, video_url, user_request, 0),
-            process_single_inference(job_id, video_url, user_request, 1),
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-
-        # Filter out None results (failed inferences)
-        successful_results = [r for r in results if r is not None]
+        # Run 2 inferences sequentially (not in parallel) to avoid OOM
+        # This reuses the same model for both inferences
+        successful_results = []
+        for i in range(2):
+            result = await process_single_inference(job_id, video_url, user_request, i)
+            if result is not None:
+                successful_results.append(result)
+            else:
+                log.warning(f"Job {job_id}: Inference #{i} failed")
 
         if not successful_results:
             # All inferences failed
@@ -547,7 +640,7 @@ async def process_generation_job(job_id: str, video_url: str, user_request: str)
 @app.post("/api/v1/gen", response_model=GenerateResponse)
 async def generate_audio(request: GenerateRequest):
     """
-    Start background music generation for a video with 3 parallel inferences.
+    Start background music generation for a video with 2 sequential inferences.
 
     Args:
         request: JSON body containing video_url and user_request
@@ -556,6 +649,9 @@ async def generate_audio(request: GenerateRequest):
         JSON response with job_id to query for results
     """
     try:
+        # Clean up old jobs to prevent memory growth
+        cleanup_old_jobs()
+
         # Generate unique job ID
         job_id = str(uuid.uuid4())
 
@@ -572,7 +668,7 @@ async def generate_audio(request: GenerateRequest):
 
         log.info(f"Created job {job_id} for video: {request.video_url}")
 
-        # Start background task with 2 parallel inferences
+        # Start background task with 2 sequential inferences
         asyncio.create_task(
             process_generation_job(job_id, request.video_url, request.user_request)
         )
@@ -590,7 +686,7 @@ async def generate_audio(request: GenerateRequest):
 @app.get("/api/v1/job/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(job_id: str):
     """
-    Get the status and results of a generation job (2 parallel inferences).
+    Get the status and results of a generation job (2 sequential inferences).
 
     Args:
         job_id: The unique job identifier
